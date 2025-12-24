@@ -1,0 +1,165 @@
+openapi: 3.0.0
+info:
+  title: Video Info API
+  description: API for extracting metadata from video files
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+paths:
+  /info:
+    post:
+      summary: Start a new video info extraction job
+      description: Creates a new video info extraction job with a client-provided UUID for idempotency
+      operationId: createInfo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InfoRequest'
+      responses:
+        '201':
+          description: Info job created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InfoJob'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: An info job with this UUID already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /info/{uuid}:
+    get:
+      summary: Get video info job status
+      description: Returns the current status of a video info extraction job
+      operationId: getInfoStatus
+      parameters:
+        - name: uuid
+          in: path
+          required: true
+          description: The UUID of the info job
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Info job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InfoJob'
+        '404':
+          description: Info job not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  schemas:
+    InfoRequest:
+      type: object
+      required:
+        - uuid
+        - videoPath
+      properties:
+        uuid:
+          type: string
+          format: uuid
+          description: Client-provided UUID for the info job
+          example: 550e8400-e29b-41d4-a716-446655440000
+        videoPath:
+          type: string
+          description: Path to the video file to inspect
+          example: /videos/movie.mkv
+    InfoJob:
+      type: object
+      required:
+        - uuid
+        - status
+        - videoPath
+        - createdAt
+        - updatedAt
+      properties:
+        uuid:
+          type: string
+          format: uuid
+          description: Unique identifier for the info job
+        status:
+          $ref: '#/components/schemas/InfoStatus'
+        videoPath:
+          type: string
+          description: Path to the video file being inspected
+        result:
+          $ref: '#/components/schemas/VideoInfo'
+        error:
+          type: string
+          description: Error message if the info extraction failed
+        createdAt:
+          type: string
+          format: date-time
+          description: Timestamp when the job was created
+        updatedAt:
+          type: string
+          format: date-time
+          description: Timestamp when the job was last updated
+    VideoInfo:
+      type: object
+      required:
+        - totalDurationSeconds
+        - chapterDurationsSeconds
+      properties:
+        totalDurationSeconds:
+          type: number
+          format: double
+          description: Total duration of the video in seconds
+          example: 7200.5
+        chapterDurationsSeconds:
+          type: array
+          items:
+            type: number
+            format: double
+          description: Duration of each chapter in seconds
+          example: [1800.0, 1800.0, 1800.0, 1800.5]
+    InfoStatus:
+      type: string
+      enum:
+        - pending
+        - running
+        - completed
+        - failed
+      description: Current status of the info extraction job
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: Error code
+          example: INVALID_REQUEST
+        message:
+          type: string
+          description: Human-readable error message
+          example: The video path is invalid
