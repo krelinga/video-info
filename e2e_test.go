@@ -1,9 +1,12 @@
 package videoinfo
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -69,6 +72,39 @@ func TestTranscodeEndToEnd(t *testing.T) {
 	t.Cleanup(func() {
 		dumpContainerLogs(t, ctx, postgresContainer, "postgres")
 	})
+
+	// Start MockServer container for webhook testing
+	mockServerReq := testcontainers.ContainerRequest{
+		Image:          "mockserver/mockserver:5.15.0",
+		ExposedPorts:   []string{"1080/tcp"},
+		Networks:       []string{networkName},
+		NetworkAliases: map[string][]string{networkName: {"mockserver"}},
+		WaitingFor:     wait.ForLog("started on port: 1080"),
+	}
+	mockServerContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: mockServerReq,
+		Started:          true,
+	})
+	if err != nil {
+		t.Fatalf("failed to start mockserver container: %v", err)
+	}
+	t.Cleanup(func() {
+		dumpContainerLogs(t, ctx, mockServerContainer, "mockserver")
+	})
+
+	// Get MockServer mapped port for verification calls
+	mockServerPort, err := mockServerContainer.MappedPort(ctx, "1080")
+	if err != nil {
+		t.Fatalf("failed to get mockserver mapped port: %v", err)
+	}
+	mockServerHost, err := mockServerContainer.Host(ctx)
+	if err != nil {
+		t.Fatalf("failed to get mockserver host: %v", err)
+	}
+	mockServerURL := fmt.Sprintf("http://%s:%s", mockServerHost, mockServerPort.Port())
+
+	// Set up MockServer expectation for webhook endpoint
+	setupMockServerExpectation(t, mockServerURL, "/webhook")
 
 	// Common environment variables for server and worker
 	dbEnv := map[string]string{
@@ -153,13 +189,17 @@ func TestTranscodeEndToEnd(t *testing.T) {
 		t.Fatalf("failed to create virest client: %v", err)
 	}
 
-	// Create info job
+	// Create info job with webhook
 	jobUUID := uuid.New()
 	sourcePath := "/nas/media/testdata_sample_640x360.mkv"
+	webhookURI := "http://mockserver:1080/webhook"
+	webhookToken := []byte("test-webhook-token")
 
 	createResp, err := client.CreateInfoWithResponse(ctx, virest.CreateInfoJSONRequestBody{
-		Uuid:       jobUUID,
-		VideoPath: sourcePath,
+		Uuid:         jobUUID,
+		VideoPath:    sourcePath,
+		WebhookUri:   &webhookURI,
+		WebhookToken: webhookToken,
 	})
 	if err != nil {
 		t.Fatalf("failed to create info job: %v", err)
@@ -199,14 +239,35 @@ func TestTranscodeEndToEnd(t *testing.T) {
 		t.Fatalf("expected job to complete successfully, but got status: %s", finalJob.Status)
 	}
 
-	// TODO: Verify extracted info fields once implemented
+	// TODO: Verify extracted info fields
 	t.Log(deep.Format(deep.NewEnv(), finalJob))
 
 	t.Logf("Info job completed successfully with UUID: %s", jobUUID)
 
+	// Verify webhook was received
+	webhookPayload := waitForWebhook(t, ctx, mockServerURL, "/webhook", 30*time.Second)
+	if webhookPayload == nil {
+		t.Fatalf("webhook was not received within timeout")
+	}
+
+	// Verify webhook payload contents
+	if webhookPayload.Uuid != jobUUID {
+		t.Errorf("webhook UUID mismatch: got %s, want %s", webhookPayload.Uuid, jobUUID)
+	}
+	if !bytes.Equal(webhookPayload.Token, webhookToken) {
+		t.Errorf("webhook token mismatch: got %v, want %v", webhookPayload.Token, webhookToken)
+	}
+	if webhookPayload.Result == nil {
+		t.Errorf("webhook result should not be nil for successful job")
+	}
+	if webhookPayload.Error != nil {
+		t.Errorf("webhook error should be nil for successful job, got: %s", *webhookPayload.Error)
+	}
+	t.Logf("Webhook received successfully: %s", deep.Format(deep.NewEnv(), webhookPayload))
+
 	// Test duplicate UUID rejection - try to create another job with same UUID but different destination
 	duplicateResp, err := client.CreateInfoWithResponse(ctx, virest.CreateInfoJSONRequestBody{
-		Uuid:       jobUUID,
+		Uuid:      jobUUID,
 		VideoPath: sourcePath,
 	})
 	if err != nil {
@@ -256,4 +317,134 @@ func dumpContainerLogs(t *testing.T, ctx context.Context, container testcontaine
 	}
 
 	t.Logf("=== %s container logs ===\n%s", name, string(logBytes))
+}
+
+// WebhookPayload matches the structure sent by the webhook worker
+type WebhookPayload struct {
+	Token  []byte            `json:"token,omitempty"`
+	Uuid   uuid.UUID         `json:"uuid"`
+	Result *virest.VideoInfo `json:"result,omitempty"`
+	Error  *string           `json:"error,omitempty"`
+}
+
+// setupMockServerExpectation configures MockServer to accept POST requests
+func setupMockServerExpectation(t *testing.T, mockServerURL, path string) {
+	expectation := map[string]interface{}{
+		"httpRequest": map[string]interface{}{
+			"method": "POST",
+			"path":   path,
+		},
+		"httpResponse": map[string]interface{}{
+			"statusCode": 200,
+		},
+	}
+
+	body, _ := json.Marshal(expectation)
+	req, err := http.NewRequest(http.MethodPut, mockServerURL+"/mockserver/expectation", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("failed to create mockserver expectation request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to set up mockserver expectation: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 201 {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("failed to set up mockserver expectation, status %d: %s", resp.StatusCode, respBody)
+	}
+}
+
+// waitForWebhook polls MockServer for received requests until one is found or timeout
+func waitForWebhook(t *testing.T, ctx context.Context, mockServerURL, path string, timeout time.Duration) *WebhookPayload {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		payload, found := checkForWebhook(t, mockServerURL, path)
+		if found {
+			return payload
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return nil
+}
+
+// checkForWebhook queries MockServer for recorded requests
+func checkForWebhook(t *testing.T, mockServerURL, path string) (*WebhookPayload, bool) {
+	reqBody := map[string]interface{}{
+		"path": path,
+	}
+	body, _ := json.Marshal(reqBody)
+
+	req, err := http.NewRequest(http.MethodPut, mockServerURL+"/mockserver/retrieve?type=REQUESTS", bytes.NewReader(body))
+	if err != nil {
+		t.Logf("failed to create retrieve request: %v", err)
+		return nil, false
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Logf("failed to retrieve mockserver requests: %v", err)
+		return nil, false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Logf("mockserver retrieve returned status %d: %s", resp.StatusCode, respBody)
+		return nil, false
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, false
+	}
+
+	// MockServer returns an array of recorded requests with nested body structure
+	var requests []struct {
+		Body struct {
+			Type   string          `json:"type"`
+			Json   json.RawMessage `json:"json"`
+			String string          `json:"string"`
+		} `json:"body"`
+	}
+
+	if err := json.Unmarshal(respBody, &requests); err != nil {
+		t.Logf("failed to parse mockserver response: %v, body: %s", err, respBody)
+		return nil, false
+	}
+
+	if len(requests) == 0 {
+		return nil, false
+	}
+
+	// Try parsing from json field first, then string field
+	var payload WebhookPayload
+	bodyData := requests[0].Body.Json
+	if len(bodyData) == 0 && requests[0].Body.String != "" {
+		bodyData = []byte(requests[0].Body.String)
+	}
+
+	if len(bodyData) == 0 {
+		t.Logf("no body data found in request")
+		return nil, false
+	}
+
+	if err := json.Unmarshal(bodyData, &payload); err != nil {
+		t.Logf("failed to parse webhook payload: %v, body: %s", err, bodyData)
+		return nil, false
+	}
+
+	return &payload, true
 }
