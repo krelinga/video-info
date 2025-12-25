@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"os/exec"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/krelinga/video-info/internal"
 	"github.com/riverqueue/river"
+	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 )
 
 // ffprobeOutput represents the JSON output from ffprobe.
@@ -28,6 +31,7 @@ type ffprobeChapter struct {
 // InfoWorker handles video information extraction jobs.
 type InfoWorker struct {
 	river.WorkerDefaults[internal.InfoJobArgs]
+	DBPool *pgxpool.Pool
 }
 
 // Work executes the video info extraction job using ffprobe.
@@ -44,6 +48,41 @@ func (w *InfoWorker) Work(ctx context.Context, job *river.Job[internal.InfoJobAr
 
 	if err := river.RecordOutput(ctx, status); err != nil {
 		return fmt.Errorf("failed to record output: %w", err)
+	}
+
+	// Enqueue webhook job if webhook URI is configured
+	if job.Args.WebhookURI != nil {
+		webhookArgs := internal.WebhookJobArgs{
+			URI:    *job.Args.WebhookURI,
+			Token:  job.Args.WebhookToken,
+			Uuid:   job.Args.UUID,
+			Status: &status,
+		}
+
+		// Start a transaction to insert webhook job and complete info job atomically
+		tx, err := w.DBPool.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %w", err)
+		}
+		defer tx.Rollback(ctx)
+
+		client := river.ClientFromContext[pgx.Tx](ctx)
+		if client == nil {
+			return fmt.Errorf("no river client in context for webhook job insertion")
+		}
+
+		if _, err := client.InsertTx(ctx, tx, webhookArgs, nil); err != nil {
+			return fmt.Errorf("failed to enqueue webhook job: %w", err)
+		}
+
+		// Complete the current job within the same transaction
+		if _, err := river.JobCompleteTx[*riverpgxv5.Driver](ctx, tx, job); err != nil {
+			return fmt.Errorf("failed to complete job in transaction: %w", err)
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("failed to commit transaction: %w", err)
+		}
 	}
 
 	return nil

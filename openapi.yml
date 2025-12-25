@@ -92,6 +92,16 @@ components:
           type: string
           description: Path to the video file to inspect
           example: /videos/movie.mkv
+        webhookUri:
+          type: string
+          format: uri
+          description: Optional URI to POST results to when job completes
+          example: https://example.com/webhook
+        webhookToken:
+          type: string
+          format: byte
+          description: Optional base64-encoded token to include in webhook POST body
+          example: c29tZS10b2tlbi12YWx1ZQ==
     InfoJob:
       type: object
       required:

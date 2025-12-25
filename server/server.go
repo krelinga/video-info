@@ -40,8 +40,10 @@ func (s *Server) CreateInfo(ctx context.Context, request virest.CreateInfoReques
 	}
 
 	jobArgs := internal.InfoJobArgs{
-		UUID: uuid.UUID(request.Body.Uuid),
-		Path: request.Body.VideoPath,
+		UUID:         uuid.UUID(request.Body.Uuid),
+		Path:         request.Body.VideoPath,
+		WebhookURI:   request.Body.WebhookUri,
+		WebhookToken: request.Body.WebhookToken,
 	}
 
 	// Use a transaction to insert job and mapping atomically
@@ -176,10 +178,7 @@ func (s *Server) GetInfoStatus(ctx context.Context, request virest.GetInfoStatus
 	}
 	var result *virest.VideoInfo
 	if jobStatus.Result != nil {
-		result = &virest.VideoInfo{
-			TotalDurationSeconds:    jobStatus.Result.DurationSeconds,
-			ChapterDurationsSeconds: jobStatus.Result.ChapterDurationsSeconds,
-		}
+		result = jobStatus.Result.RESTVideoInfo()
 	}
 	return virest.GetInfoStatus200JSONResponse{
 		Uuid:      request.Uuid,

@@ -43,7 +43,8 @@ func run() error {
 
 	// Create River workers and register info worker
 	workers := river.NewWorkers()
-	river.AddWorker(workers, &InfoWorker{})
+	river.AddWorker(workers, &InfoWorker{DBPool: pool})
+	river.AddWorker(workers, &WebhookWorker{})
 
 	// Create River client with workers
 	riverClient, err := river.NewClient(riverpgxv5.New(pool), &river.Config{
