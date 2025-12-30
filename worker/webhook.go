@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -55,6 +56,7 @@ func (w *WebhookWorker) Work(ctx context.Context, job *river.Job[internal.Webhoo
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
 
+	log.Printf("Sending webhook request to %q", req.URL.String())
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send webhook request: %w", err)
